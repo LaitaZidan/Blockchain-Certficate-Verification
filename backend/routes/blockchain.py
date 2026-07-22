@@ -1,10 +1,12 @@
 from flask import Blueprint, request, jsonify
 from config import web3, contract
+from utils.timing import timed
 
 blockchain_bp = Blueprint("blockchain", __name__)
 
 # Menyimpan signature ke blockchain
 # Mengembalikan certificate_id hasil generate otomatis oleh smart contract
+@timed("blockchain_submit")
 def store_signature(signature: str) -> str:
     sender_address = web3.eth.accounts[0]
     tx_hash = contract.functions.addCertificate(signature).transact({'from': sender_address, 'gas': 2000000})

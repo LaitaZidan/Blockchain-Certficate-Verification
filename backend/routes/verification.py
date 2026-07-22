@@ -10,6 +10,7 @@ from database.mongo import get_certificate_by_id, collection_verify_logs
 from database.auth import get_fingerprint
 from utils.verification_utils import process_single_certificate
 from utils.verification_utils import jalankan_proses_verifikasi
+from config import contract
 
 
 verification_bp = Blueprint("verification", __name__)
@@ -32,29 +33,23 @@ def verify():
             return jsonify({"error": "No file uploaded"}), 400
 
         file = request.files['file']
-        temp_path = os.path.join(tempfile.gettempdir(), file.filename)
-        file.save(temp_path)
+        image = Image.open(file.stream).convert("RGB")
+        image_np = np.array(image)
 
         result = process_single_certificate(
-            file_path=temp_path,
+            image_np=image_np,
             filename=file.filename,
             username=session.get("username", "admin")
         )
 
-        # Hapus file sementara
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
-        # Jika error, respon sesuai status
-        if result.get("status") not in ["success", "invalid"]:
-            return
+        return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @verification_bp.route("/verify_certificate_zip", methods=["POST"])
-def verify_certificate_zip(): 
+def verify_certificate_zip():
     expected_fingerprint = session.get("fingerprint")
-    current_fingerprint = session.get("current_fingerprint")
+    current_fingerprint = get_fingerprint()
 
     if expected_fingerprint != current_fingerprint:
         session.clear()

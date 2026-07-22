@@ -16,6 +16,7 @@ from crypto.rsa_utils import load_private_key, sign_data
 from crypto.aes_utils import encrypt_data
 from routes.blockchain import store_signature
 from database.auth import get_fingerprint
+from utils.timing import timed
 
 certificate_bp = Blueprint("certificate", __name__)
 
@@ -35,6 +36,7 @@ def format_date(date_str):
 def get_certificate_id_from_blockchain():
     return contract.functions.certificateCounter().call()
 
+@timed("generation")
 def generate_certificate(data):
     # Validasi input
     required_fields = [

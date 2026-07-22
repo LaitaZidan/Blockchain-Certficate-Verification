@@ -1,6 +1,5 @@
 web3
 Flask
-flask
 Flask-session
 cryptography
 qrcode
@@ -10,14 +9,14 @@ ipfshttpclient
 celery
 redis
 requests
-dotenv
+python-dotenv
 pillow
 pymongo
 pandas
 bcrypt
 easyocr
-datetime
-qrcode
 numpy
 pyzbar
 torch
+pycryptodome
+pytesseract
