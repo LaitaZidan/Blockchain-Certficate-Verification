@@ -2,6 +2,9 @@ from flask import Blueprint, request, jsonify, send_file, session
 import io
 import base64
 import os
+import contextlib
+import multiprocessing
+import concurrent.futures
 import qrcode
 import numpy as np
 import pandas as pd
@@ -11,7 +14,13 @@ from PIL import ImageFont
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 from config import contract, AES_SECRET_KEY
-from database.mongo import save_certificate_data, get_certificate_by_id, collection_cert
+from database.mongo import (
+    save_certificate_data,
+    build_certificate_document,
+    save_certificates_bulk,
+    get_certificate_by_id,
+    collection_cert,
+)
 from crypto.hash_utils import generate_md5_hash
 from crypto.rsa_utils import load_private_key, sign_data
 from crypto.aes_utils import encrypt_data
@@ -21,6 +30,17 @@ from utils.timing import timed
 from utils.layout import TEMPLATE_PATH, FIELD_ANCHORS, QR_POSITION, QR_SIZE, FONT_PATH, FONT_SIZE
 
 certificate_bp = Blueprint("certificate", __name__)
+
+# G6: serializes only the blockchain submit-wait-read-counter section (store_signature)
+# across worker processes, so certificate_id assignment (still read from the global
+# on-chain counter, unchanged from Sprint 0/1) can't race under parallel batch
+# generation. Everything else in generate_certificate runs fully in parallel.
+# Defaults to a no-op for the single-certificate path, where there's no pool.
+_blockchain_lock = contextlib.nullcontext()
+
+def _init_batch_worker(lock):
+    global _blockchain_lock
+    _blockchain_lock = lock
 
 # G1: template loaded/decoded once at import; copy() per certificate below.
 if not os.path.exists(TEMPLATE_PATH):
@@ -46,7 +66,7 @@ def get_certificate_id_from_blockchain():
     return contract.functions.certificateCounter().call()
 
 @timed("generation")
-def generate_certificate(data):
+def generate_certificate(data, save_to_db=True):
     # Validasi input
     required_fields = [
         "no_sertifikat", "name", "student_id", "department", "test_date",
@@ -89,7 +109,8 @@ def generate_certificate(data):
     encrypted_info = encrypt_data(user_info, AES_SECRET_KEY)
 
     # Transaksi ke blockchain
-    certificate_id = store_signature(signature)
+    with _blockchain_lock:
+        certificate_id = store_signature(signature)
     contract_address = contract.address
 
     # Buat QR code
@@ -134,8 +155,9 @@ def generate_certificate(data):
     img.save(cert_buffer, format="PNG")
     cert_base64 = base64.b64encode(cert_buffer.getvalue()).decode()
 
-    # Simpan ke database
-    save_certificate_data(
+    # G8: build the document and hand the image back in-process; the caller
+    # (single-generate vs batch) decides how it gets persisted.
+    document = build_certificate_document(
         certificate_id=certificate_id,
         contract_address=contract_address,
         encrypted_data_sertif=encrypted_info,
@@ -143,7 +165,16 @@ def generate_certificate(data):
         cert_base64=cert_base64
     )
 
-    return certificate_id
+    if save_to_db:
+        save_certificate_data(
+            certificate_id=certificate_id,
+            contract_address=contract_address,
+            encrypted_data_sertif=encrypted_info,
+            qr_base64=qr_base64,
+            cert_base64=cert_base64
+        )
+
+    return certificate_id, cert_base64, document
 
 
 @certificate_bp.route("/generate_certificate", methods=["POST"])
@@ -162,7 +193,7 @@ def generate():
     
     try:
         data = request.get_json()
-        certificate_id = generate_certificate(data)
+        certificate_id, _cert_base64, _document = generate_certificate(data)
         return jsonify({
             "message": "Certificate generated successfully",
             "certificate_id": certificate_id,
@@ -213,48 +244,57 @@ def upload_excel_and_download_zip():
         if col not in df.columns:
             return jsonify({"error": f"Missing column: {col}"}), 400
 
-    # Siapkan folder sementara untuk PNG hasil generate
-    temp_folder = "temp_certificates"
-    if os.path.exists(temp_folder):
-        shutil.rmtree(temp_folder)
-    os.makedirs(temp_folder)
+    rows = [row.to_dict() for _, row in df.iterrows()]
 
+    # G6: parallelize batch generation across CPU cores. Each worker runs the
+    # full per-certificate pipeline (render + hash + sign + encrypt) and does
+    # NOT write to Mongo itself (save_to_db=False) - G7 does one bulk write
+    # below instead. "spawn" is forced explicitly so worker start-up behaves
+    # identically on macOS and Linux.
     generated_ids = []
+    documents = []
+    zip_entries = []
 
-    for _, row in df.iterrows():
-        data = row.to_dict()
-        try:
-            certificate_id = generate_certificate(data)
-            generated_ids.append(certificate_id)
+    max_workers = min(len(rows), os.cpu_count() or 1) or 1
+    mp_context = multiprocessing.get_context("spawn")
+    lock = mp_context.Lock()
 
-            # Ambil dari Mongo
-            record = get_certificate_by_id(certificate_id, contract.address)
-            cert_b64 = record.get("certificate_png")
-            cert_binary = base64.b64decode(cert_b64)
-
-            # Simpan PNG ke temp folder
-            with open(os.path.join(temp_folder, f"{certificate_id}.png"), "wb") as f_out:
-                f_out.write(cert_binary)
-
-        except Exception as e:
-            print(f"Gagal generate untuk {data['name']}: {e}")
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=max_workers,
+        mp_context=mp_context,
+        initializer=_init_batch_worker,
+        initargs=(lock,),
+    ) as executor:
+        future_to_row = {
+            executor.submit(generate_certificate, row, save_to_db=False): row
+            for row in rows
+        }
+        for future in concurrent.futures.as_completed(future_to_row):
+            row = future_to_row[future]
+            try:
+                certificate_id, cert_base64, document = future.result()
+                generated_ids.append(certificate_id)
+                documents.append(document)
+                zip_entries.append((certificate_id, base64.b64decode(cert_base64)))
+            except Exception as e:
+                print(f"Gagal generate untuk {row.get('name')}: {e}")
 
     if not generated_ids:
         return jsonify({"error": "Tidak ada sertifikat berhasil dibuat"}), 500
 
-    # Buat ZIP
-    zip_path = "all_certificates.zip"
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        for filename in os.listdir(temp_folder):
-            file_path = os.path.join(temp_folder, filename)
-            zipf.write(file_path, filename)
+    # G7: single bulk write for the whole batch instead of one upsert per certificate.
+    save_certificates_bulk(documents)
 
-    # Bersihkan folder temp
-    shutil.rmtree(temp_folder)
+    # G9: build the ZIP in memory instead of writing per-file PNGs to a temp directory.
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w") as zipf:
+        for certificate_id, png_bytes in zip_entries:
+            zipf.writestr(f"{certificate_id}.png", png_bytes)
+    zip_buffer.seek(0)
 
     # Kirim ZIP sebagai download
     return send_file(
-        zip_path,
+        zip_buffer,
         mimetype="application/zip",
         as_attachment=True,
         download_name="all_certificates.zip"
