@@ -6,6 +6,10 @@ from web3 import Web3
 # Load environment variables
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
+# NOTE: GANACHE_URL is expected to point at a local Ganache instance running in
+# "instamine" mode (transactions mined immediately). Receipt-wait latency (B6)
+# is tuned against that assumption; it is an experimental variable, not a
+# production deployment setting.
 GANACHE_URL = os.getenv("GANACHE_URL")
 CONTRACT_ADDRESS = os.getenv("CONTRACT_ADDRESS")
 AES_SECRET_KEY = os.getenv("AES_SECRET_KEY")

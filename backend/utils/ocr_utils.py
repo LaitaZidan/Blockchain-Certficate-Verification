@@ -1,15 +1,13 @@
 import numpy as np
 import easyocr
 import os
-from celery import Celery
+from celery import shared_task
 from utils.qr_utils import extract_certificate_id_from_qr
 from utils.ocr_logic import extract_text_from_image  # dipisah logika ekstrak OCR agar modular
 
-celery = Celery("tasks")
-
 reader = easyocr.Reader(["en", "id"], gpu=True)
 
-@celery.task(name="tasks.run_ocr_and_extract")
+@shared_task(name="tasks.run_ocr_and_extract")
 def run_ocr_and_extract(file_path):
     try:
         img_np = np.load(file_path)

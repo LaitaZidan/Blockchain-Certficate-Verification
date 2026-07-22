@@ -1,8 +1,3 @@
-import easyocr
-
-# OCR reader global (gunakan GPU jika tersedia)
-reader = easyocr.Reader(['en', 'id'], gpu=True)
-
 def extract_text_from_image(results):
     print("📄 Hasil EasyOCR:")
     for r in results:
