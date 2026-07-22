@@ -3,6 +3,7 @@ import io
 import base64
 import os
 import qrcode
+import numpy as np
 import pandas as pd
 import shutil
 import zipfile
@@ -17,12 +18,20 @@ from crypto.aes_utils import encrypt_data
 from routes.blockchain import store_signature
 from database.auth import get_fingerprint
 from utils.timing import timed
+from utils.layout import TEMPLATE_PATH, FIELD_ANCHORS, QR_POSITION, QR_SIZE, FONT_PATH, FONT_SIZE
 
 certificate_bp = Blueprint("certificate", __name__)
 
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-FONT_DIR = os.path.join(os.path.dirname(BASE_DIR), "static", "font")
-TEMPLATE_PATH = os.path.join(os.path.dirname(BASE_DIR), "static", "pect_template.png")
+# G1: template loaded/decoded once at import; copy() per certificate below.
+if not os.path.exists(TEMPLATE_PATH):
+    raise FileNotFoundError("Template sertifikat tidak ditemukan")
+_TEMPLATE_IMAGE = Image.open(TEMPLATE_PATH)
+
+# G2: font object loaded once at import.
+try:
+    _FONT_DEFAULT = ImageFont.truetype(FONT_PATH, FONT_SIZE)
+except IOError:
+    _FONT_DEFAULT = ImageFont.load_default()
 
 # Fungsi untuk format tanggal
 def format_date(date_str):
@@ -85,53 +94,40 @@ def generate_certificate(data):
 
     # Buat QR code
     qr_data = f"https://127.0.0.1:5000/verify?certificate_id={certificate_id}"
-    qr_img = qrcode.make(qr_data).convert("RGBA").resize((200, 200))
+    qr_img = qrcode.make(qr_data).convert("RGBA").resize(QR_SIZE)
     qr_buffer = io.BytesIO()
     qr_img.save(qr_buffer, format="PNG")
     qr_base64 = base64.b64encode(qr_buffer.getvalue()).decode()
-    
-    # Ambil pixel dan buat transparan
-    datas = qr_img.getdata()
-    newData = []
-    for item in datas:
-        # Jika putih, buat transparan
-        if item[:3] == (255, 255, 255):
-            newData.append((255, 255, 255, 0))  # 0 = transparan
-        else:
-            newData.append(item)
 
-    qr_img.putdata(newData)
+    # G4: vectorized transparent QR (replaces the per-pixel Python loop;
+    # output pixels are identical: white -> alpha 0, everything else untouched).
+    qr_arr = np.array(qr_img)
+    white_mask = np.all(qr_arr[:, :, :3] == 255, axis=-1)
+    qr_arr[white_mask, 3] = 0
+    qr_img = Image.fromarray(qr_arr, mode="RGBA")
 
-    # Load template sertifikat
-    if not os.path.exists(TEMPLATE_PATH):
-        raise FileNotFoundError("Template sertifikat tidak ditemukan")
-
-    img = Image.open(TEMPLATE_PATH)
+    # G1: reuse the template loaded once at import.
+    img = _TEMPLATE_IMAGE.copy()
     draw = ImageDraw.Draw(img)
 
-    # Font
-    try:
-        font_path = os.path.join(FONT_DIR, "Montserrat-SemiBold.ttf")
-        font_default = ImageFont.truetype(font_path, 25)
-        
-    except IOError:
-        font_default = font_big = ImageFont.load_default()
+    # G2: reuse the font object loaded once at import.
+    font_default = _FONT_DEFAULT
 
-    # Insert data ke posisi yang sesuai
-    draw.text((1005, 454), data["no_sertifikat"], font=font_default, fill="black")
-    draw.text((415, 502), data["name"], font=font_default, fill="black")
-    draw.text((415, 536), data["student_id"], font=font_default, fill="black")
-    draw.text((1225, 502), data["department"], font=font_default, fill="black")
-    draw.text((1225, 536), data["test_date"], font=font_default, fill="black")
+    # Insert data ke posisi yang sesuai (G5: anchors from the shared layout module)
+    draw.text(FIELD_ANCHORS["no_sertifikat"], data["no_sertifikat"], font=font_default, fill="black")
+    draw.text(FIELD_ANCHORS["name"], data["name"], font=font_default, fill="black")
+    draw.text(FIELD_ANCHORS["student_id"], data["student_id"], font=font_default, fill="black")
+    draw.text(FIELD_ANCHORS["department"], data["department"], font=font_default, fill="black")
+    draw.text(FIELD_ANCHORS["test_date"], data["test_date"], font=font_default, fill="black")
 
-    draw.text((640, 655), str(data["listening"]), font=font_default, fill="black")
-    draw.text((980, 655), str(data["reading"]), font=font_default, fill="black")
-    draw.text((1310, 655), str(data["total_lr"]), font=font_default, fill="black")
+    draw.text(FIELD_ANCHORS["listening"], str(data["listening"]), font=font_default, fill="black")
+    draw.text(FIELD_ANCHORS["reading"], str(data["reading"]), font=font_default, fill="black")
+    draw.text(FIELD_ANCHORS["total_lr"], str(data["total_lr"]), font=font_default, fill="black")
 
-    draw.text((830, 948), str(data["writing"]), font=font_default, fill="black")
-    draw.text((1130, 948), str(data["total_writing"]), font=font_default, fill="black")
+    draw.text(FIELD_ANCHORS["writing"], str(data["writing"]), font=font_default, fill="black")
+    draw.text(FIELD_ANCHORS["total_writing"], str(data["total_writing"]), font=font_default, fill="black")
 
-    img.paste(qr_img, (880, 1090), qr_img)
+    img.paste(qr_img, QR_POSITION, qr_img)
 
     # Simpan hasil sertifikat ke buffer base64
     cert_buffer = io.BytesIO()
