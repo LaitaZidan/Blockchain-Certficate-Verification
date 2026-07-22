@@ -38,9 +38,14 @@ def generate_rsa_keys():
         print("RSA keys generated successfully.")
 
 # Fungsi untuk memuat kunci
+_private_key_cache = None
+
 def load_private_key():
-    with open(private_key_path, "rb") as f:
-        return serialization.load_pem_private_key(f.read(), password=None)
+    global _private_key_cache
+    if _private_key_cache is None:
+        with open(private_key_path, "rb") as f:
+            _private_key_cache = serialization.load_pem_private_key(f.read(), password=None)
+    return _private_key_cache
 
 def load_public_key():
     with open(public_key_path, "rb") as f:
