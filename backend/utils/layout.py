@@ -31,3 +31,22 @@ FIELD_ANCHORS = {
 
 QR_POSITION = (880, 1090)
 QR_SIZE = (200, 200)
+
+# V1 (Sprint 4): ROI crop boxes (left, top, right, bottom) for verification
+# OCR, derived from FIELD_ANCHORS + the rendered text's actual measured
+# extent on the template (see the field label positions - each box is sized
+# to fully contain the value without touching the neighboring label or the
+# adjacent field's row). no_sertifikat/name/student_id are the signed fields
+# (I1/I2); department/test_date are OCR'd the same way for display only and
+# are never part of the hash input.
+FIELD_ROI_BOXES = {
+    "no_sertifikat": (1000, 450, 1655, 500),
+    "name": (410, 494, 1020, 538),
+    "student_id": (410, 538, 1020, 582),
+    "department": (1223, 494, 1800, 538),
+    "test_date": (1223, 538, 1800, 582),
+}
+
+# Frozen signed field set (I1/I2) - these three feed the MD5 hash used for
+# RSA verification. Do not add or remove fields here (§1.7 of the spec).
+SIGNED_FIELDS = ("no_sertifikat", "name", "student_id")

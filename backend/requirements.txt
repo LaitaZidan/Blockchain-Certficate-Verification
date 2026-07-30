@@ -4,6 +4,7 @@ Flask-session
 cryptography
 qrcode
 opencv-python
+openpyxl
 flask-cors
 ipfshttpclient
 celery
@@ -14,9 +15,7 @@ pillow
 pymongo
 pandas
 bcrypt
-easyocr
 numpy
 pyzbar
-torch
 pycryptodome
 pytesseract
