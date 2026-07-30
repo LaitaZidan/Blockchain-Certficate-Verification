@@ -17,3 +17,9 @@ frontend/dist/
 .vscode/
 .DS_Store
 Thumbs.db
+
+backend/.venv/
+backend/node_modules/
+backend/.env
+__pycache__/
+*.pyc

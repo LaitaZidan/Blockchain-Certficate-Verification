@@ -59,3 +59,11 @@ def get_certificate_by_id(certificate_id, contract_address):
 def save_verify_log(data: dict):
     data["timestamp"] = datetime.utcnow()
     collection_verify_logs.insert_one(data)
+
+def update_verify_log_ipfs(certificate_id, ipfs_cid, ipfs_url):
+    """V9: fills in the IPFS fields on an already-written verify log once the
+    deferred upload completes, so /api/verify/<certificate_id> picks them up."""
+    collection_verify_logs.update_one(
+        {"certificate_id": certificate_id},
+        {"$set": {"ipfs_cid": ipfs_cid, "ipfs_url": ipfs_url}},
+    )

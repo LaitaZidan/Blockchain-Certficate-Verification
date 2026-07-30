@@ -9,8 +9,8 @@ from flask import session
 from database.mongo import get_certificate_by_id, collection_verify_logs
 from database.auth import get_fingerprint
 from utils.verification_utils import process_single_certificate
-from utils.verification_utils import jalankan_proses_verifikasi
-from config import contract
+from utils.verification_utils import jalankan_proses_verifikasi_batch
+from config import contract, GATEWAY_URL
 
 
 verification_bp = Blueprint("verification", __name__)
@@ -71,24 +71,24 @@ def verify_certificate_zip():
         with ZipFile(uploaded_zip, 'r') as zip_ref:
             zip_ref.extractall(temp_dir)
 
-        results = []
+        files = []
         for filename in os.listdir(temp_dir):
             path = os.path.join(temp_dir, filename)
             try:
-                img = Image.open(path).convert("RGB")
-                img_np = np.array(img)
-                result = jalankan_proses_verifikasi(img_np, filename, username)
-                results.append(result)
+                with open(path, "rb") as f:
+                    files.append((filename, f.read()))
             except Exception as e:
-                results.append({"file": filename, "status": f"Error saat proses: {str(e)}"})
+                print(f"Gagal membaca {filename}: {e}")
 
         # Hapus direktori sementara
         shutil.rmtree(temp_dir)
 
+        # V6: dispatch the whole batch as one Celery group of coarse tasks.
+        dispatch_result = jalankan_proses_verifikasi_batch(files, username)
+
         return jsonify({
             "message": "Task verifikasi berhasil dikirim ke antrean",
-            "total_files": len(results),
-            "results": results
+            **dispatch_result,
         })
 
     except Exception as e:
@@ -109,6 +109,12 @@ def api_verify_certificate(certificate_id):
 
     contract_address = log.get("contract_address") or contract.address
 
+    # Reconstruct from the stored CID + this machine's own gateway config,
+    # rather than trusting the URL frozen in at write time (which may have
+    # been written by a different machine/port and no longer resolve here).
+    ipfs_cid = log.get("ipfs_cid")
+    ipfs_url = f"{GATEWAY_URL}{ipfs_cid}" if ipfs_cid else None
+
     return jsonify({
         "valid": True,
         "certificate_id": certificate_id,
@@ -118,8 +124,8 @@ def api_verify_certificate(certificate_id):
         "no_sertifikat": log.get("no_sertifikat"),
         "test_date": log.get("test_date"),
         "hash": log.get("hash"),
-        "ipfs_cid": log.get("ipfs_cid"),
-        "ipfs_url": log.get("ipfs_url"),
+        "ipfs_cid": ipfs_cid,
+        "ipfs_url": ipfs_url,
         "verified_at": log.get("timestamp").strftime("%Y-%m-%d"),
         "note": log.get("note", "")
     })
