@@ -72,3 +72,9 @@ Thumbs.db
 # ✅ GIT PROTEKSI
 # ================================
 !.gitignore
+
+backend/.venv/
+backend/node_modules/
+backend/.env
+__pycache__/
+*.pyc

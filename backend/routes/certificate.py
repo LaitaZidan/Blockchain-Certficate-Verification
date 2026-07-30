@@ -2,7 +2,6 @@ from flask import Blueprint, request, jsonify, send_file, session
 import io
 import base64
 import os
-import contextlib
 import multiprocessing
 import concurrent.futures
 import qrcode
@@ -24,23 +23,19 @@ from database.mongo import (
 from crypto.hash_utils import generate_md5_hash
 from crypto.rsa_utils import load_private_key, sign_data
 from crypto.aes_utils import encrypt_data
-from routes.blockchain import store_signature
+from routes.blockchain import (
+    store_signature,
+    get_certificate_counter,
+    get_next_nonce,
+    format_certificate_id,
+    submit_certificate_tx,
+    wait_for_certificate_receipts,
+)
 from database.auth import get_fingerprint
 from utils.timing import timed
 from utils.layout import TEMPLATE_PATH, FIELD_ANCHORS, QR_POSITION, QR_SIZE, FONT_PATH, FONT_SIZE
 
 certificate_bp = Blueprint("certificate", __name__)
-
-# G6: serializes only the blockchain submit-wait-read-counter section (store_signature)
-# across worker processes, so certificate_id assignment (still read from the global
-# on-chain counter, unchanged from Sprint 0/1) can't race under parallel batch
-# generation. Everything else in generate_certificate runs fully in parallel.
-# Defaults to a no-op for the single-certificate path, where there's no pool.
-_blockchain_lock = contextlib.nullcontext()
-
-def _init_batch_worker(lock):
-    global _blockchain_lock
-    _blockchain_lock = lock
 
 # G1: template loaded/decoded once at import; copy() per certificate below.
 if not os.path.exists(TEMPLATE_PATH):
@@ -65,8 +60,12 @@ def format_date(date_str):
 def get_certificate_id_from_blockchain():
     return contract.functions.certificateCounter().call()
 
-@timed("generation")
-def generate_certificate(data, save_to_db=True):
+def _prepare_certificate(data):
+    """Everything that does NOT depend on certificate_id: validate, hash, sign,
+    encrypt, and render the certificate body (no QR yet). Safe to run in a
+    batch worker process (G6) - the QR and blockchain submission are handled
+    separately once certificate_id is known (see _finalize_certificate and
+    Sprint 3's B1/B2/B4b batch flow below)."""
     # Validasi input
     required_fields = [
         "no_sertifikat", "name", "student_id", "department", "test_date",
@@ -96,8 +95,6 @@ def generate_certificate(data, save_to_db=True):
     print("📌 HASH input saat generate:", hash_input)
     md5_hash = generate_md5_hash(hash_input)
 
-
-
     # Digital signature
     private_key = load_private_key()
     signature = sign_data(md5_hash, private_key)
@@ -107,25 +104,6 @@ def generate_certificate(data, save_to_db=True):
         **{k: data[k] for k in required_fields},
     }
     encrypted_info = encrypt_data(user_info, AES_SECRET_KEY)
-
-    # Transaksi ke blockchain
-    with _blockchain_lock:
-        certificate_id = store_signature(signature)
-    contract_address = contract.address
-
-    # Buat QR code
-    qr_data = f"https://127.0.0.1:5000/verify?certificate_id={certificate_id}"
-    qr_img = qrcode.make(qr_data).convert("RGBA").resize(QR_SIZE)
-    qr_buffer = io.BytesIO()
-    qr_img.save(qr_buffer, format="PNG")
-    qr_base64 = base64.b64encode(qr_buffer.getvalue()).decode()
-
-    # G4: vectorized transparent QR (replaces the per-pixel Python loop;
-    # output pixels are identical: white -> alpha 0, everything else untouched).
-    qr_arr = np.array(qr_img)
-    white_mask = np.all(qr_arr[:, :, :3] == 255, axis=-1)
-    qr_arr[white_mask, 3] = 0
-    qr_img = Image.fromarray(qr_arr, mode="RGBA")
 
     # G1: reuse the template loaded once at import.
     img = _TEMPLATE_IMAGE.copy()
@@ -148,31 +126,69 @@ def generate_certificate(data, save_to_db=True):
     draw.text(FIELD_ANCHORS["writing"], str(data["writing"]), font=font_default, fill="black")
     draw.text(FIELD_ANCHORS["total_writing"], str(data["total_writing"]), font=font_default, fill="black")
 
+    body_buffer = io.BytesIO()
+    img.save(body_buffer, format="PNG")
+
+    return {
+        "signature": signature,
+        "encrypted_info": encrypted_info,
+        "body_png_bytes": body_buffer.getvalue(),
+    }
+
+
+def _finalize_certificate(body_png_bytes, certificate_id):
+    """Everything that DOES depend on certificate_id: generate the QR and
+    paste it onto the already-rendered body. PNG round-trip is lossless, so
+    output stays byte-identical to rendering it all in one pass."""
+    img = Image.open(io.BytesIO(body_png_bytes))
+
+    qr_data = f"https://127.0.0.1:5000/verify?certificate_id={certificate_id}"
+    qr_img = qrcode.make(qr_data).convert("RGBA").resize(QR_SIZE)
+    qr_buffer = io.BytesIO()
+    qr_img.save(qr_buffer, format="PNG")
+    qr_base64 = base64.b64encode(qr_buffer.getvalue()).decode()
+
+    # G4: vectorized transparent QR (replaces the per-pixel Python loop;
+    # output pixels are identical: white -> alpha 0, everything else untouched).
+    qr_arr = np.array(qr_img)
+    white_mask = np.all(qr_arr[:, :, :3] == 255, axis=-1)
+    qr_arr[white_mask, 3] = 0
+    qr_img = Image.fromarray(qr_arr, mode="RGBA")
+
     img.paste(qr_img, QR_POSITION, qr_img)
 
-    # Simpan hasil sertifikat ke buffer base64
     cert_buffer = io.BytesIO()
     img.save(cert_buffer, format="PNG")
     cert_base64 = base64.b64encode(cert_buffer.getvalue()).decode()
 
-    # G8: build the document and hand the image back in-process; the caller
-    # (single-generate vs batch) decides how it gets persisted.
+    return qr_base64, cert_base64
+
+
+@timed("generation")
+def generate_certificate(data):
+    """Single-certificate path: prepare, submit+confirm its one transaction
+    (B1/B2/B4b/B6/B8 via store_signature), finalize, and persist immediately."""
+    prepared = _prepare_certificate(data)
+
+    certificate_id = store_signature(prepared["signature"])
+    contract_address = contract.address
+
+    qr_base64, cert_base64 = _finalize_certificate(prepared["body_png_bytes"], certificate_id)
+
     document = build_certificate_document(
         certificate_id=certificate_id,
         contract_address=contract_address,
-        encrypted_data_sertif=encrypted_info,
+        encrypted_data_sertif=prepared["encrypted_info"],
         qr_base64=qr_base64,
         cert_base64=cert_base64
     )
-
-    if save_to_db:
-        save_certificate_data(
-            certificate_id=certificate_id,
-            contract_address=contract_address,
-            encrypted_data_sertif=encrypted_info,
-            qr_base64=qr_base64,
-            cert_base64=cert_base64
-        )
+    save_certificate_data(
+        certificate_id=certificate_id,
+        contract_address=contract_address,
+        encrypted_data_sertif=prepared["encrypted_info"],
+        qr_base64=qr_base64,
+        cert_base64=cert_base64
+    )
 
     return certificate_id, cert_base64, document
 
@@ -246,41 +262,57 @@ def upload_excel_and_download_zip():
 
     rows = [row.to_dict() for _, row in df.iterrows()]
 
-    # G6: parallelize batch generation across CPU cores. Each worker runs the
-    # full per-certificate pipeline (render + hash + sign + encrypt) and does
-    # NOT write to Mongo itself (save_to_db=False) - G7 does one bulk write
-    # below instead. "spawn" is forced explicitly so worker start-up behaves
-    # identically on macOS and Linux.
-    generated_ids = []
-    documents = []
-    zip_entries = []
-
+    # Phase 1 (G6): parallelize the certificate-id-independent work (validate,
+    # hash, sign, encrypt, render body) across CPU cores. "spawn" is forced
+    # explicitly so worker start-up behaves identically on macOS and Linux.
+    prepared = []
     max_workers = min(len(rows), os.cpu_count() or 1) or 1
     mp_context = multiprocessing.get_context("spawn")
-    lock = mp_context.Lock()
 
     with concurrent.futures.ProcessPoolExecutor(
-        max_workers=max_workers,
-        mp_context=mp_context,
-        initializer=_init_batch_worker,
-        initargs=(lock,),
+        max_workers=max_workers, mp_context=mp_context
     ) as executor:
-        future_to_row = {
-            executor.submit(generate_certificate, row, save_to_db=False): row
-            for row in rows
-        }
+        future_to_row = {executor.submit(_prepare_certificate, row): row for row in rows}
         for future in concurrent.futures.as_completed(future_to_row):
             row = future_to_row[future]
             try:
-                certificate_id, cert_base64, document = future.result()
-                generated_ids.append(certificate_id)
-                documents.append(document)
-                zip_entries.append((certificate_id, base64.b64decode(cert_base64)))
+                prepared.append(future.result())
             except Exception as e:
                 print(f"Gagal generate untuk {row.get('name')}: {e}")
 
-    if not generated_ids:
+    if not prepared:
         return jsonify({"error": "Tidak ada sertifikat berhasil dibuat"}), 500
+
+    # Phase 2 (B1/B2/B4b/B6/B8): assign certificate IDs deterministically from
+    # nonce order (no extra on-chain read - B4b), submit every transaction
+    # without waiting (B2), then confirm all receipts in a single pass (I5).
+    # Nonces/IDs are only assigned to rows that survived Phase 1, so the
+    # sender's nonce sequence stays contiguous even if some rows failed above.
+    start_counter = get_certificate_counter()
+    start_nonce = get_next_nonce()
+
+    tx_hashes = []
+    certificate_ids = []
+    for index, item in enumerate(prepared):
+        certificate_ids.append(format_certificate_id(start_counter, index))
+        tx_hashes.append(submit_certificate_tx(item["signature"], start_nonce + index))
+
+    wait_for_certificate_receipts(tx_hashes)
+
+    contract_address = contract.address
+    documents = []
+    zip_entries = []
+    for item, certificate_id in zip(prepared, certificate_ids):
+        qr_base64, cert_base64 = _finalize_certificate(item["body_png_bytes"], certificate_id)
+        document = build_certificate_document(
+            certificate_id=certificate_id,
+            contract_address=contract_address,
+            encrypted_data_sertif=item["encrypted_info"],
+            qr_base64=qr_base64,
+            cert_base64=cert_base64,
+        )
+        documents.append(document)
+        zip_entries.append((certificate_id, base64.b64decode(cert_base64)))
 
     # G7: single bulk write for the whole batch instead of one upsert per certificate.
     save_certificates_bulk(documents)

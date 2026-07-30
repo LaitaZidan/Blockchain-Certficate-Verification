@@ -1,6 +1,7 @@
 import os
 from dotenv import load_dotenv
 import json
+import redis
 from web3 import Web3
 
 # Load environment variables
@@ -16,6 +17,18 @@ AES_SECRET_KEY = os.getenv("AES_SECRET_KEY")
 GATEWAY_URL = os.getenv("GATEWAY_URL")
 IPFS_API = os.getenv("IPFS_API")
 SECRET_KEY = os.getenv("SECRET_KEY")
+
+# B8: local signing sender key (development Ganache account only).
+SENDER_PRIVATE_KEY = os.getenv("SENDER_PRIVATE_KEY") or None
+
+# B6: receipt polling interval, tuned for a local instamine node.
+RECEIPT_POLL_LATENCY = float(os.getenv("RECEIPT_POLL_LATENCY", "0.05"))
+
+# B-read/V12: Redis cache for on-chain signature reads (falls back to the
+# Celery broker's Redis instance if REDIS_URL isn't set separately).
+REDIS_URL = os.getenv("REDIS_URL") or os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
+redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+
 web3 = Web3(Web3.HTTPProvider(GANACHE_URL))
 
 # Cek koneksi ke blockchain
